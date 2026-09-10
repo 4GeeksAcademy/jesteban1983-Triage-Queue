@@ -1,87 +1,78 @@
-# Notas de Diseño — Triage Queue
+# Notas de Diseño — Branch Queue
 
-## Estructura de datos elegida: Tres `deque` separadas
+## Estructura de datos elegida: Un deque por tipo de servicio
 
-Para modelar la cola de prioridad del triaje hospitalario, opté por **tres colas `collections.deque` independientes**, una por cada nivel de triaje (1, 2 y 3).
+Para gestionar las colas de la sucursal bancaria, opté por **un diccionario con tres `collections.deque` independientes**, una por cada tipo de servicio (`deposito`, `retiro`, `gestion_cuenta`), más un **contador global** para los números de ticket secuenciales.
 
-### Alternativas consideradas
+### ¿Por qué una cola separada por servicio es mejor que una única cola compartida?
 
-| Alternativa                                 | Problemas                                                                                                                                                                                |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Una sola `deque` + ordenar**              | Insertar un paciente crítico requeriría recolocar elementos, O(n) por inserción. No escala.                                                                                              |
-| **Una `list` ordenada con `bisect.insort`** | Las inserciones son O(n) y el orden FIFO dentro del mismo nivel es difícil de garantizar si hay que intercalar.                                                                          |
-| **`heapq` (heap)**                          | Un heap ordena por prioridad pero no preserva FIFO dentro del mismo nivel a menos que añadas un contador de orden de llegada. Además, `heapq` no ofrece `popleft()` eficiente por nivel. |
-| **Tres `deque` separadas**                  | ✅ **Solución elegida.**                                                                                                                                                                 |
-
-### Por qué tres `deque` separadas es la mejor opción
-
-1. **Encolar (`enqueue`) es O(1)** — se añade al final del deque del nivel correspondiente mediante `append()`.
-2. **Desencolar (`dequeue`) es O(1)** — se consulta el primer deque no vacío empezando por el nivel 1 y se extrae con `popleft()`.
-3. **FIFO estricto dentro del mismo nivel** — cada deque es una cola FIFO por sí misma, garantizando orden de llegada sin necesidad de contadores ni timestamps adicionales.
-4. **`list_queue()` es O(n)** — se concatenan los tres deques, pero es una operación de lectura poco frecuente.
-5. **`stats()` es O(1)** — solo consultamos las longitudes de los tres deques.
+| Enfoque                                      | Problema                                                                                                                                                                                                                                                     |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Una única lista/deque compartida**         | Cuando un agente de, p. ej., depósitos queda libre, necesita encontrar al _próximo cliente de depósitos_. Con una sola cola mezclada, debe recorrerla entera (O(n)) hasta encontrar un cliente de depósitos. En una sucursal llena, esto es muy ineficiente. |
+| **Una cola por servicio (solución elegida)** | ✅ Cada agente tiene acceso directo a la cola de su servicio. `call_next("deposito")` es **O(1)**: solo hace `popleft()` sobre el deque de depósitos. Nunca ve clientes de otros servicios.                                                                  |
 
 ### Coste asintótico de cada operación
 
-| Operación          | Complejidad |
-| ------------------ | ----------- |
-| `enqueue(patient)` | O(1)        |
-| `dequeue()`        | O(1)        |
-| `peek()`           | O(1)        |
-| `list_queue()`     | O(n)        |
-| `stats()`          | O(1)        |
-| `is_empty()`       | O(1)        |
+| Operación                        | Complejidad | Explicación                                                  |
+| -------------------------------- | ----------- | ------------------------------------------------------------ |
+| `issue_ticket(nombre, servicio)` | O(1)        | Incrementa contador global, `append()` al deque del servicio |
+| `call_next(servicio)`            | O(1)        | `popleft()` del deque del servicio indicado                  |
+| `peek_next(servicio)`            | O(1)        | Acceso a `deque[0]` del servicio indicado                    |
+| `list_waiting()`                 | O(n)        | Concatena los 3 deques en un diccionario                     |
+| `stats()`                        | O(1)        | Consulta `len()` de cada deque                               |
 
-## Manejo de concurrencia (worker encolando + desencolando)
+### Numeración global secuencial
 
-El enunciado plantea el escenario en que un worker extrae un paciente de la cola mientras otro worker encola un nuevo paciente crítico. Aunque este programa es monohilo y no requiere bloqueos, es importante describir cómo se abordaría en un entorno concurrente real.
+El contador `self._counter` se incrementa en cada `issue_ticket()` **antes** de encolar el ticket. Así:
 
-### Estrategia: Bloqueo por niveles (fine-grained locking)
+- El ticket #5 de depósitos y el ticket #5 de retiros **no pueden coexistir**: cada número es único globalmente.
+- El orden de emisión entre servicios distintos se preserva en el número de ticket (si el ticket #10 es de retiros y el #11 de depósitos, sabemos que el #10 se emitió antes).
 
-En lugar de un candado global que proteja toda la estructura, usaríamos **tres candados independientes**, uno por deque. La razón es que las operaciones sobre distintos niveles no compiten por el mismo recurso.
+## Concurrencia: dos agentes del mismo servicio llaman a `call_next` simultáneamente
 
-```
+El enunciado plantea: ¿qué ocurre si dos agentes del mismo tipo de servicio llaman a `call_next` al mismo tiempo? ¿Cómo evitamos que el mismo cliente sea llamado dos veces?
+
+### Estrategia: Bloqueo por cola de servicio (fine-grained locking)
+
+En un entorno concurrente real, asignaríamos **un candado por deque** (uno por tipo de servicio):
+
+```python
 # Pseudocódigo del esquema de bloqueo
 
-dequeue():
-    for level in (1, 2, 3):
-        lock[level].acquire()
-        if queue[level] non-empty:
-            patient = queue[level].popleft()
-            lock[level].release()
-            return patient
-        lock[level].release()
-    raise Empty
-
-enqueue(patient):
-    lock[level].acquire()
-    queue[level].append(patient)
-    lock[level].release()
+call_next(service_type):
+    lock[service_type].acquire()          # 1. Adquirir candado PRIMERO
+    if queue[service_type] non-empty:
+        ticket = queue[service_type].popleft()  # 2. Mutar DENTRO del candado
+        lock[service_type].release()
+        return ticket
+    else:
+        lock[service_type].release()
+        raise Empty
 ```
 
-#### ¿Por qué este orden de mutación evita el doble procesamiento?
+#### ¿Por qué este orden evita el doble procesamiento?
 
-1. **El desencolado comprueba primero nivel 1, luego 2, luego 3.**  
-   Mientras mantiene el candado del nivel actual, ningún otro worker puede modificar ese deque.
-2. **El encolado solo adquiere el candado del nivel del paciente.**  
-   Si un worker está desencolando del nivel 2, otro worker puede encolar un paciente crítico en nivel 1 sin interferencia.
-3. **No hay condición de carrera (race condition) crítica** porque el desencolado comprueba existencia del elemento _dentro_ de la sección crítica. No hay ventana entre "comprobar si hay elementos" y "extraer".
+1. **La adquisición del candado ocurre antes de cualquier comprobación.**  
+   Dos agentes nunca pueden estar dentro de la misma sección crítica al mismo tiempo.
 
-#### Doble procesamiento
+2. **La comprobación de existencia y la extracción son atómicas.**  
+   No hay ventana entre "comprobar si hay elementos" y "extraer". Si el deque tiene un elemento, el agente que adquirió el candado primero lo extrae; el otro agente espera y, cuando adquiere el candado, encuentra el deque vacío.
 
-El "doble procesamiento" ocurriría si dos workers pudieran extraer al mismo paciente. Con bloqueo por niveles:
+3. **El candado por servicio permite concurrencia real entre servicios diferentes.**  
+   Un agente de depósitos y uno de retiros pueden operar en paralelo sin bloquearse mutuamente, porque adquieren candados distintos.
 
-- Worker A adquiere `lock[1]`, encuentra un paciente, lo extrae y libera `lock[1]`.
-- Worker B intenta adquirir `lock[1]` pero está tomado por A. Worker B espera.
-- Cuando A libera `lock[1]`, B lo adquiere, pero el deque ya está vacío (el paciente se fue con A).
-- B continúa al nivel 2.
+### Orden de mutación crítico
 
-Ningún paciente puede ser extraído dos veces porque la extracción (`popleft()`) ocurre dentro de la sección crítica y es atómica desde la perspectiva de otros workers.
+```
+ADQUIRIR candado → COMPROBAR si hay elementos → EXTRAER y DEVOLVER → LIBERAR candado
+```
+
+Si invirtiéramos el orden —comprobar primero, luego adquirir—, dos agentes podrían ver `len(queue) > 0` simultáneamente antes de que ninguno adquiera el candado, y ambos intentarían extraer al mismo cliente.
 
 ### Nota sobre este proyecto
 
-Dado que el programa actual es monohilo (CLI interactiva), no se implementan bloqueos. Esta sección describe únicamente cómo se extendería el diseño para un entorno concurrente real, como un sistema de producción con múltiples workers atendiendo pacientes simultáneamente.
+Dado que el programa actual es monohilo (CLI interactiva), no se implementan bloqueos. Esta sección describe cómo se extendería el diseño para un entorno concurrente real con múltiples agentes (hilos) atendiendo clientes simultáneamente en la misma sucursal.
 
 ---
 
-_Documento de diseño para el proyecto Triage Queue — 4Geeks Academy_
+_Documento de diseño para el proyecto Branch Queue — 4Geeks Academy_
